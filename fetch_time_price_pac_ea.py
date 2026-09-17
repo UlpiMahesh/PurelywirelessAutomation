@@ -1,0 +1,350 @@
+from playwright.sync_api import sync_playwright
+import pandas as pd
+import re
+import time
+from pathlib import Path
+from openpyxl import Workbook
+import uuid
+import asyncio
+import sys
+
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+LOGINS_FILE = BASE_DIR / "marketlogins.xlsx"
+
+
+# ─────────────────────────────────────────
+# 🔹 BROWSER FACTORY
+# ─────────────────────────────────────────
+def new_browser(p):
+    browser = p.chromium.launch(
+        headless=False,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    )
+    return browser
+
+
+def new_page(browser):
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/115.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1920, "height": 1080},
+        java_script_enabled=True,
+    )
+    page = context.new_page()
+    page.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined })"
+    )
+    return page
+
+
+# ─────────────────────────────────────────
+# 🔹 LOGIN
+# ─────────────────────────────────────────
+def login(page, username, password):
+    page.goto("https://www.t-mobiledealerordering.com/")
+    page.fill("#userid", username)
+    page.fill("#password", password)
+    page.click("input[name='AgreeTerms']")
+    page.click("a[name='login']")
+    page.wait_for_load_state("load")
+    page.wait_for_timeout(5000)
+
+    print(f"[{username}] URL: {page.url}")
+    print(f"[{username}] Frames: {[f.url for f in page.frames]}")
+
+    if "login.do" in page.url:
+        print(f"[{username}] ❌ LOGIN FAILED")
+        return False
+
+    print(f"[{username}] ✅ Login success")
+    return True
+
+
+# ─────────────────────────────────────────
+# 🔹 HELPERS
+# ─────────────────────────────────────────
+def find_in_frames(page, locator_str, timeout=15):
+    for _ in range(timeout):
+        for frame in page.frames:
+            try:
+                loc = frame.locator(locator_str)
+                if loc.count() > 0:
+                    return frame, loc
+            except Exception:
+                pass
+        time.sleep(1)
+    return None, None
+
+
+def click_in_frames(page, locator_str, timeout=15):
+    for _ in range(timeout):
+        for frame in page.frames:
+            try:
+                loc = frame.locator(locator_str)
+                if loc.count() > 0:
+                    loc.first.click()
+                    return True
+            except Exception:
+                pass
+        time.sleep(1)
+    return False
+
+
+def parse_price(price_text):
+    """
+    Parse price text into a float.
+    "12,979.80 USD" → 12979.80
+    """
+    match = re.search(r"[\d,]+\.\d+", price_text.replace("\xa0", " "))
+    if match:
+        return float(match.group(0).replace(",", ""))
+    return None
+
+
+# ─────────────────────────────────────────
+# 🔹 WAIT FOR PRICE TO CHANGE
+# ─────────────────────────────────────────
+def wait_for_price_change(item_locator, old_price_text, timeout=15):
+    """
+    Poll the .cat-prd-prc element on this item until its text differs
+    from old_price_text (meaning the page updated after unit change).
+    Returns the new price text, or old_price_text if timed out.
+    """
+    for _ in range(timeout):
+        try:
+            current = item_locator.locator(".cat-prd-prc").first.inner_text().strip()
+            if current != old_price_text:
+                return current
+        except Exception:
+            pass
+        time.sleep(1)
+    return old_price_text  # timed out — return whatever is there
+
+
+# ─────────────────────────────────────────
+# 🔹 CATALOG PRICE SCRAPER (PAC + EA per item)
+# ─────────────────────────────────────────
+def scrape_catalog_prices(page, market, item_type, sap_code, timeout=15):
+    """
+    For each catalog item:
+      1. Read PAC price (default)
+      2. Switch unit select to EA
+      3. Wait for price to update
+      4. Read EA price
+    Returns list of dicts with PAC Price and EA Price columns.
+    """
+    frame, _ = find_in_frames(page, ".catalauge-item-holder", timeout=timeout)
+    if not frame:
+        print(f"[{market}] ❌ No catalog items found for type={item_type}")
+        return []
+
+    items = frame.locator(".catalauge-item-holder").all()
+    devices = []
+
+    for idx, item in enumerate(items):
+        try:
+            name = item.locator(".cat-prd-dsc").inner_text().strip()
+            sku  = item.locator(".cat-prd-id").inner_text().strip()
+
+            # ── PAC price (default, already selected) ──
+            price_loc = item.locator(".cat-prd-prc")
+            if price_loc.count() == 0:
+                print(f"[{market}] ⚠️ No price element for SKU {sku} — skipping")
+                continue
+
+            pac_text = price_loc.first.inner_text().strip()
+            pac_price = parse_price(pac_text)
+            if pac_price is None:
+                print(f"[{market}] ⚠️ Could not parse PAC price: '{pac_text}' for SKU {sku} — skipping")
+                continue
+
+            print(f"[{market}] [{idx}] {sku} PAC={pac_price}")
+
+            # ── Switch unit select to EA ──
+            # The select id is itemqty[0], itemqty[1], etc. — use idx
+            unit_select = item.locator(f"select[id='itemqty[{idx}]']")
+
+            if unit_select.count() == 0:
+                # Fallback: find any select inside this item
+                unit_select = item.locator("select")
+
+            if unit_select.count() == 0:
+                print(f"[{market}] ⚠️ No unit select for SKU {sku} — storing PAC only")
+                devices.append({
+                    "Market":    market,
+                    "SAP Code":  sap_code,
+                    "SKU":       sku,
+                    "Name":      name,
+                    "PAC Price": pac_price,
+                    "EA Price":  None,
+                    "Type":      item_type,
+                })
+                continue
+
+            unit_select.first.select_option("EA")
+            time.sleep(1)  # give the page a moment to fire the change event
+
+            # ── Wait for price to actually change ──
+            ea_text = wait_for_price_change(item, pac_text, timeout=10)
+            ea_price = parse_price(ea_text)
+
+            print(f"[{market}] [{idx}] {sku} EA={ea_price}")
+
+            devices.append({
+                "Market":    market,
+                "SAP Code":  sap_code,
+                "SKU":       sku,
+                "Name":      name,
+                "PAC Price": pac_price,
+                "EA Price":  ea_price,
+                "Type":      item_type,
+            })
+
+        except Exception as e:
+            print(f"[{market}] ⚠️ Error parsing item {idx}: {e}")
+            continue
+
+    return devices
+
+
+# ─────────────────────────────────────────
+# 🔹 PER-MARKET SCRAPE
+# ─────────────────────────────────────────
+def scrape_prices_for_market(page, row):
+    market   = row["Market"]
+    username = row["Username"]
+    password = row["Password"]
+    sap_code = row.get("SAP Codes", "")
+
+    if not login(page, username, password):
+        return []
+
+    frame, loc = find_in_frames(page, "#credithold-tab-msg", timeout=20)
+    if frame:
+        print(f"[{market}] ✅ Home page loaded")
+    else:
+        print(f"[{market}] ⚠️ credithold-tab-msg not found — proceeding anyway")
+
+    # ── 1. Click Catalog tab ──
+    if not click_in_frames(page, "//a[@onclick='show_catalog_view()']"):
+        print(f"[{market}] ❌ Catalog button not found")
+        return []
+
+    time.sleep(3)
+    catalog_devices = scrape_catalog_prices(page, market, "Catalog", sap_code)
+    print(f"[{market}] ✅ Catalog items: {len(catalog_devices)}")
+
+    # ── 2. Click CPO tab ──
+    cpo_selectors = [
+        "a:has-text('CPO')",
+        "a:has-text('Pre-Owned')",
+        "//a[contains(text(),'CPO')]",
+        "//a[contains(text(),'Pre-Owned')]",
+    ]
+
+    cpo_clicked = False
+    for sel in cpo_selectors:
+        if click_in_frames(page, sel, timeout=5):
+            cpo_clicked = True
+            print(f"[{market}] ✅ CPO tab clicked via: {sel}")
+            break
+
+    if not cpo_clicked:
+        print(f"[{market}] ❌ CPO tab not found — returning catalog only")
+        return catalog_devices
+
+    # ── 3. Wait for CPO content to load ──
+    cpo_loaded = False
+    for _ in range(20):
+        for frame in page.frames:
+            try:
+                frame_text = frame.inner_text("body", timeout=500)
+                has_cpo_text = (
+                    "cpo" in frame_text.lower()
+                    or "pre-owned" in frame_text.lower()
+                    or "certified" in frame_text.lower()
+                )
+                has_items = frame.locator(".catalauge-item-holder").count() > 0
+                if has_cpo_text and has_items:
+                    cpo_loaded = True
+                    break
+            except Exception:
+                pass
+        if cpo_loaded:
+            break
+        time.sleep(1)
+
+    if not cpo_loaded:
+        print(f"[{market}] ⚠️ CPO page did not load — returning catalog only")
+        return catalog_devices
+
+    time.sleep(1)
+    cpo_devices = scrape_catalog_prices(page, market, "CPO", sap_code)
+    print(f"[{market}] ✅ CPO items: {len(cpo_devices)}")
+
+    return catalog_devices + cpo_devices
+
+
+# ─────────────────────────────────────────
+# 🔹 RUNNER
+# ─────────────────────────────────────────
+def run_prices(selected_markets=None):
+    df = pd.read_excel(LOGINS_FILE)
+    df.columns = df.columns.str.strip()
+
+    if selected_markets:
+        df = df[df["Market"].str.lower().isin([m.lower() for m in selected_markets])]
+
+    rows = [row for _, row in df.iterrows()]
+    results_map = {}
+
+    with sync_playwright() as p:
+        browser = new_browser(p)
+
+        for row in rows:
+            page = new_page(browser)
+            try:
+                devices = scrape_prices_for_market(page, row)
+                results_map[row["Market"]] = devices
+                print(f"[{row['Market']}] Total devices scraped: {len(devices)}")
+            finally:
+                page.close()
+
+        browser.close()
+
+    output = BASE_DIR / f"data/prices_{uuid.uuid4().hex}.xlsx"
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["SAP Code", "Market", "SKU", "Name", "PAC Price (USD)", "EA Price (USD)", "Type"])
+
+    for market, devices in results_map.items():
+        for d in devices:
+            ws.append([
+                d.get("SAP Code", ""),
+                d["Market"],
+                d["SKU"],
+                d["Name"],
+                d.get("PAC Price"),
+                d.get("EA Price"),
+                d.get("Type", ""),
+            ])
+
+    wb.save(output)
+    print(f"✅ Prices saved: {output}")
+    return str(output)
+
+
+if __name__ == "__main__":
+    run_prices(["RGV"])
