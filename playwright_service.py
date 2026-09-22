@@ -15,6 +15,10 @@ BASE_DIR = Path(__file__).resolve().parent
 LOGINS_FILE = BASE_DIR / "marketlogins.xlsx"
 
 
+print("BASE_DIR =", BASE_DIR)
+print("LOGINS_FILE =", LOGINS_FILE)
+print("LOGINS EXISTS =", LOGINS_FILE.exists())
+
 # ─────────────────────────────────────────
 # 🔹 BROWSER FACTORY  (consistent anti-bot setup everywhere)
 # ─────────────────────────────────────────
