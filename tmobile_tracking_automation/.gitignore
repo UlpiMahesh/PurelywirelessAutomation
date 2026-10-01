@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Credentials
+data/marketlogins.xlsx
+
+# Generated files
+output/*.xlsx
+logs/*.log
+screenshots/*.png
+
+# Local input files
+# Uncomment if you do not want order files tracked:
+# input/*.xlsx
