@@ -1,6 +1,27 @@
 """
 Multi-market IMEI export automation for t-mobiledealerordering.com
 
+v3 changes (login failure handling):
+  - Login failures are CLASSIFIED instead of a generic True/False:
+        password_expired / bad_credentials / account_locked   -> final, never retried
+        login_error / login_rejected / panel_not_found        -> retried later
+    Retrying a wrong or expired password can lock the account, so only
+    failures that could plausibly be transient are retried.
+  - Retryable failures are DEFERRED: every other market runs first, then the
+    failed markets are retried together (fresh browser context each time,
+    LOGIN_RETRY_DELAY_SEC cooldown before each round, LOGIN_RETRY_ROUNDS rounds).
+    Retrying is safe because these failures happen before any download.
+  - A plain-text report is written for the run (no log-reading needed):
+        <script folder>/LOGIN_FAILURES.txt        (overwritten every run)
+        logs/login_failures_<run id>.txt          (history)
+    e.g.  "Dallas - login failed password expired"
+  - run_imei_export() returns "login_failures" so a UI can show them; the CLI
+    exits with code 2 if any market could not log in; a loud ACTION NEEDED
+    banner is printed/logged at the end of the run.
+  - Blank Username/Password cells in marketlogins.xlsx are caught up front.
+  - Removed a duplicated wait_for_value() definition; browser contexts are
+    now closed after each market.
+
 v2 changes (fixing failures seen in production run):
   - Status/Creation Date are re-verified and re-applied on EVERY date
     iteration, not just once at the start — the portal was silently
@@ -39,6 +60,54 @@ LOG_DIR = BASE_DIR / "logs"
 SCREENSHOT_DIR = BASE_DIR / "logs" / "screenshots"
 
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Login failure report files (see write_login_failure_report)
+LOGIN_FAILURES_LATEST = BASE_DIR / "LOGIN_FAILURES.txt"          # always the most recent run
+LOGIN_FAILURES_RUN = LOG_DIR / f"login_failures_{RUN_ID}.txt"    # kept per run
+
+# Deferred retry settings — retries happen only after ALL other markets finish
+LOGIN_RETRY_ROUNDS = 2          # how many times to re-attempt failed-login markets
+LOGIN_RETRY_DELAY_SEC = 60      # cooldown before each retry round
+
+# ─────────────────────────────────────────
+# 🔹 LOGIN FAILURE CLASSIFICATION
+# ─────────────────────────────────────────
+LOGIN_STATUS_LABELS = {
+    "password_expired": "login failed password expired",
+    "bad_credentials":  "login failed invalid username or password",
+    "account_locked":   "login failed account locked",
+    "login_error":      "login failed portal error/timeout",
+    "login_rejected":   "login failed reason not recognised",
+    "panel_not_found":  "logged in but search panel not found",
+}
+
+# Only these are retried. Wrong/expired/locked credentials never fix themselves,
+# and repeating a bad login is how accounts get locked.
+RETRYABLE_LOGIN_STATUSES = {"login_error", "login_rejected", "panel_not_found"}
+
+_I = re.IGNORECASE
+# Checked in order; first match wins. NOTE: these are wording guesses — when a
+# real failure lands in "login_rejected", the log contains the page text
+# snippet; add the portal's actual wording here.
+LOGIN_TEXT_PATTERNS = [
+    ("password_expired", [
+        re.compile(r"password\s+(has\s+|is\s+)?(already\s+)?expired", _I),
+        re.compile(r"expired\s+password", _I),
+        re.compile(r"(must|need\s+to|required\s+to)\s+(change|reset|update)\s+your\s+password", _I),
+    ]),
+    ("account_locked", [
+        re.compile(r"(account|user\s*id|user\s*name).{0,40}(locked|disabled|suspended|deactivated)", _I),
+        re.compile(r"too\s+many\s+(failed|invalid|unsuccessful)\s+(login|attempt|sign)", _I),
+    ]),
+    ("bad_credentials", [
+        re.compile(r"(invalid|incorrect|wrong)\s+(user\s*id|user\s*name|password|credentials|login)", _I),
+        re.compile(r"(user\s*id|user\s*name|password).{0,30}(not\s+recogni[sz]ed|is\s+incorrect|is\s+invalid)", _I),
+        re.compile(r"login\s+(failed|unsuccessful)", _I),
+    ]),
+]
+# A forced password-change screen often redirects away from login.do
+EXPIRED_URL_HINTS = ("changepassword", "change_password", "changepwd", "passwordchange",
+                     "resetpassword", "pwdexpired", "expiredpassword")
 
 # ─────────────────────────────────────────
 # 🔹 LOGGING
@@ -98,9 +167,49 @@ def new_page(browser):
 # ─────────────────────────────────────────
 # 🔹 LOGIN
 # ─────────────────────────────────────────
-def login(page, market, username, password):
+def _page_text(page, limit=4000):
+    """Visible text from the top page and every frame (best effort)."""
+    chunks = []
+    for frame in page.frames:
+        try:
+            chunks.append(frame.locator("body").inner_text(timeout=2000))
+        except Exception:
+            pass
+    return "\n".join(chunks)[:limit]
+
+
+def classify_login_page(page, market="?"):
+    """
+    Looks at what is on screen and returns one of
+    "password_expired" / "account_locked" / "bad_credentials", or None if
+    nothing recognisable is found. Never raises.
+    """
     try:
-        page.goto("https://www.t-mobiledealerordering.com/")
+        text = _page_text(page)
+        url = (page.url or "").lower()
+    except Exception:
+        return None
+
+    for status, patterns in LOGIN_TEXT_PATTERNS:
+        for pat in patterns:
+            if pat.search(text):
+                return status
+
+    if any(hint in url for hint in EXPIRED_URL_HINTS):
+        return "password_expired"
+
+    snippet = re.sub(r"\s+", " ", text).strip()[:300]
+    log(market, f"Login page not recognised. URL={url} | text starts: {snippet!r}", "warning")
+    return None
+
+
+def login(page, market, username, password):
+    """
+    Returns (status, detail). status == "ok" on success, otherwise one of
+    LOGIN_STATUS_LABELS' keys. Never raises.
+    """
+    try:
+        page.goto("https://www.t-mobiledealerordering.com/", timeout=60000)
         page.fill("#userid", username)
         page.fill("#password", password)
         page.click("input[name='AgreeTerms']")
@@ -108,15 +217,18 @@ def login(page, market, username, password):
         page.wait_for_load_state("load")
         page.wait_for_timeout(5000)
     except Exception as e:
-        log(market, f"LOGIN FAILED — {e}", "error")
-        return False
+        detail = f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
+        log(market, f"LOGIN ERROR — {detail}", "error")
+        return "login_error", detail
 
     if "login.do" in page.url:
-        log(market, "LOGIN FAILED — check credentials in marketlogins.xlsx", "error")
-        return False
+        status = classify_login_page(page, market) or "login_rejected"
+        detail = LOGIN_STATUS_LABELS[status]
+        log(market, f"LOGIN FAILED — {detail}", "error")
+        return status, detail
 
     log(market, "Login success")
-    return True
+    return "ok", ""
 
 
 # ─────────────────────────────────────────
@@ -246,21 +358,6 @@ class SearchPanelLostError(RuntimeError):
     panel that isn't there; the caller should abort the rest of that
     market's dates instead of retrying each one 3x for nothing."""
     pass
-
-
-def wait_for_value(page, locator_str, expected_value, market, timeout=10):
-    """
-    Polls a select/input's actual value until it matches what we set, or
-    times out. select_option() returning doesn't mean the portal's onchange
-    handler has finished processing it — confirming the value stuck is the
-    only way to know the correction actually registered before we proceed.
-    """
-    for _ in range(timeout * 2):
-        val = read_value_in_frames(page, locator_str, market, timeout=1)
-        if val == expected_value:
-            return True
-        time.sleep(0.5)
-    return False
 
 
 def verify_and_fix_filters(page, market):
@@ -474,24 +571,60 @@ def process_date(page, market, date_str, out_dir, max_attempts=3):
 # ─────────────────────────────────────────
 # 🔹 PER-MARKET EXPORT
 # ─────────────────────────────────────────
-def export_market(page, row, start_date, end_date, out_dir):
+def _is_blank(value):
+    return value is None or (isinstance(value, float) and pd.isna(value)) or str(value).strip() == ""
+
+
+def export_market(page, row, start_date, end_date, out_dir, attempt_no=1):
     market = row["Market"]
     username = row["Username"]
     password = row["Password"]
 
-    result = {"market": market, "success": [], "no_orders": [], "failed": {}, "login_failed": False}
+    result = {
+        "market": market, "success": [], "no_orders": [], "failed": {},
+        "login_failed": False, "login_status": "ok", "login_detail": "",
+        "login_message": "", "retryable": False, "login_attempts": attempt_no,
+    }
 
-    if not login(page, market, username, password):
-        result["login_failed"] = True
+    def fail_login(status, detail):
+        """Marks the market as login-failed, snapshots the screen, returns result."""
+        label = LOGIN_STATUS_LABELS.get(status, status)
+        result.update(
+            login_failed=True,
+            login_status=status,
+            login_detail=detail,
+            login_message=label if (not detail or detail == label) else f"{label} ({detail})",
+            retryable=status in RETRYABLE_LOGIN_STATUSES,
+        )
+        save_failure_screenshot(page, market, f"login_{status}_try{attempt_no}")
         return result
+
+    # Blank cells would otherwise surface as an obscure Playwright TypeError
+    # and be mistaken for a transient (retryable) error.
+    if _is_blank(username) or _is_blank(password):
+        log(market, "Username or Password is blank in marketlogins.xlsx", "error")
+        result.update(
+            login_failed=True, login_status="bad_credentials", retryable=False,
+            login_detail="username/password blank in marketlogins.xlsx",
+            login_message=f"{LOGIN_STATUS_LABELS['bad_credentials']} (blank in marketlogins.xlsx)",
+        )
+        return result
+
+    status, detail = login(page, market, str(username), str(password))
+    if status != "ok":
+        return fail_login(status, detail)
 
     try:
         open_search_panel(page, market)
     except Exception as e:
-        log(market, f"Could not open search panel — aborting market: {e}", "error")
-        save_failure_screenshot(page, market, "search_panel")
-        result["failed"]["search_panel"] = str(e)
-        return result
+        # Login "worked" but there's no search panel. A forced
+        # password-change screen looks exactly like this.
+        state = classify_login_page(page, market)
+        if state:
+            log(market, f"Post-login page indicates: {LOGIN_STATUS_LABELS[state]}", "error")
+            return fail_login(state, LOGIN_STATUS_LABELS[state])
+        log(market, f"Could not open search panel — {e}", "error")
+        return fail_login("panel_not_found", str(e))
 
     for date_str in daterange(start_date, end_date):
         try:
@@ -585,8 +718,87 @@ def write_excel_with_retry(df, output_path, interactive=True):
 
 
 # ─────────────────────────────────────────
+# 🔹 LOGIN FAILURE REPORT
+# ─────────────────────────────────────────
+def collect_login_failures(all_results):
+    """Final (post-retry) login failures as a list of plain dicts — UI friendly."""
+    return [
+        {
+            "market": r["market"],
+            "status": r["login_status"],
+            "message": r["login_message"] or LOGIN_STATUS_LABELS.get(r["login_status"], r["login_status"]),
+            "attempts": r.get("login_attempts", 1),
+        }
+        for r in all_results if r.get("login_failed")
+    ]
+
+
+def write_login_failure_report(all_results):
+    """
+    Writes a plain-text report so nobody has to read the log to find out a
+    market didn't run. Overwritten every run (LOGIN_FAILURES.txt) and kept
+    per run in logs/. A run with no failures still rewrites the file, so a
+    stale failure list from an earlier run can't be mistaken for current.
+    """
+    failures = collect_login_failures(all_results)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"Login failure report - run {RUN_ID} ({stamp})", ""]
+
+    if not failures:
+        lines.append("No login failures in this run.")
+    else:
+        lines.append(f"{len(failures)} market(s) did NOT export because login failed:")
+        lines.append("")
+        for f in failures:
+            line = f"{f['market']} - {f['message']}"
+            if f["status"] in RETRYABLE_LOGIN_STATUSES:
+                line += f" [gave up after {f['attempts']} attempt(s)]"
+            lines.append(line)
+        lines.append("")
+        lines.append("Fix the credentials/portal issue, then re-run for these markets only.")
+        lines.append(f"Screenshots: {SCREENSHOT_DIR}")
+
+    text = "\n".join(lines) + "\n"
+    for path in (LOGIN_FAILURES_LATEST, LOGIN_FAILURES_RUN):
+        try:
+            path.write_text(text, encoding="utf-8")
+        except OSError as e:
+            # e.g. file open in an editor on Windows — don't lose the run over it
+            logger.error(f"Could not write login failure report {path}: {e}")
+
+    return failures
+
+
+# ─────────────────────────────────────────
 # 🔹 RUNNER
 # ─────────────────────────────────────────
+def _run_one_market(browser, row, start_date, end_date, attempt_no):
+    """Fresh browser context per attempt, always cleaned up, never raises."""
+    market = row.get("Market", "UNKNOWN")
+    page = new_page(browser)
+    try:
+        result = export_market(page, row, start_date, end_date, DOWNLOAD_DIR, attempt_no)
+    except Exception as e:
+        log(market, f"Market aborted by unexpected error — {e}", "error")
+        save_failure_screenshot(page, market, "market_level_crash")
+        result = {
+            "market": market, "success": [], "no_orders": [],
+            "failed": {"MARKET_LEVEL": str(e)},
+            "login_failed": False, "login_status": "ok", "login_detail": "",
+            "login_message": "", "retryable": False, "login_attempts": attempt_no,
+        }
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+        try:
+            page.context.close()
+        except Exception:
+            pass
+    return result
+
+
 def run_imei_export(start_date, end_date, selected_markets=None, interactive=True):
     df = pd.read_excel(LOGINS_FILE)
     df.columns = df.columns.str.strip()
@@ -597,28 +809,50 @@ def run_imei_export(start_date, end_date, selected_markets=None, interactive=Tru
     rows = [row for _, row in df.iterrows()]
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    all_results = []
-    all_files = []
+    results_by_idx = {}   # idx -> latest result for that market (retries overwrite)
 
-    with sync_playwright() as p:
-        browser = new_browser(p)
-        for row in rows:
-            page = new_page(browser)
-            market = row.get("Market", "UNKNOWN")
+    try:
+        with sync_playwright() as p:
+            browser = new_browser(p)
             try:
-                result = export_market(page, row, start_date, end_date, DOWNLOAD_DIR)
-                all_results.append(result)
-                all_files.extend(result["success"])
-            except Exception as e:
-                log(market, f"Market aborted by unexpected error — {e}", "error")
-                save_failure_screenshot(page, market, "market_level_crash")
-                all_results.append({
-                    "market": market, "success": [], "no_orders": [],
-                    "failed": {"MARKET_LEVEL": str(e)}, "login_failed": False,
-                })
+                # ── Pass 1: every market once. Retryable login failures are
+                #    parked, NOT retried right now. ──
+                pending = []
+                for idx, row in enumerate(rows):
+                    r = _run_one_market(browser, row, start_date, end_date, attempt_no=1)
+                    results_by_idx[idx] = r
+                    if r["login_failed"] and r["retryable"]:
+                        log(r["market"], f"{r['login_message']} — deferred, will retry after all "
+                                         f"other markets finish", "warning")
+                        pending.append(idx)
+
+                # ── Deferred retry rounds: only after everything else is done ──
+                for round_no in range(1, LOGIN_RETRY_ROUNDS + 1):
+                    if not pending:
+                        break
+                    names = ", ".join(str(rows[i].get("Market", "?")) for i in pending)
+                    logger.info(f"Login retry round {round_no}/{LOGIN_RETRY_ROUNDS} for: {names} "
+                                f"(waiting {LOGIN_RETRY_DELAY_SEC}s first)")
+                    time.sleep(LOGIN_RETRY_DELAY_SEC)
+
+                    still_pending = []
+                    for idx in pending:
+                        r = _run_one_market(browser, rows[idx], start_date, end_date,
+                                            attempt_no=round_no + 1)
+                        results_by_idx[idx] = r
+                        if r["login_failed"] and r["retryable"]:
+                            still_pending.append(idx)
+                        elif not r["login_failed"]:
+                            log(r["market"], f"Login recovered on attempt {round_no + 1}")
+                    pending = still_pending
             finally:
-                page.close()
-        browser.close()
+                browser.close()
+    finally:
+        # Runs even if something above blew up, so the failure file is never skipped
+        all_results = list(results_by_idx.values())
+        login_failures = write_login_failure_report(all_results)
+
+    all_files = [f for r in all_results for f in r["success"]]
 
     # ── Summary ──
     logger.info("=" * 60)
@@ -626,11 +860,13 @@ def run_imei_export(start_date, end_date, selected_markets=None, interactive=Tru
     logger.info("=" * 60)
     for r in all_results:
         if r["login_failed"]:
-            logger.info(f"{r['market']}: LOGIN FAILED")
+            logger.info(f"{r['market']}: LOGIN FAILED — {r['login_message']} "
+                        f"(attempts: {r['login_attempts']})")
             continue
+        note = f" (login recovered on attempt {r['login_attempts']})" if r["login_attempts"] > 1 else ""
         logger.info(
             f"{r['market']}: {len(r['success'])} downloaded, "
-            f"{len(r['no_orders'])} no-orders, {len(r['failed'])} failed"
+            f"{len(r['no_orders'])} no-orders, {len(r['failed'])} failed{note}"
         )
         if r["failed"]:
             for date_str, reason in r["failed"].items():
@@ -638,8 +874,25 @@ def run_imei_export(start_date, end_date, selected_markets=None, interactive=Tru
     logger.info("=" * 60)
 
     merged_path = merge_exports(all_files, MERGED_OUTPUT, interactive=interactive)
-    return {"path": merged_path, "results": all_results}
+
+    # Last thing on the console/log so it can't be missed
+    if login_failures:
+        logger.error("!" * 60)
+        logger.error(f"ACTION NEEDED — {len(login_failures)} market(s) did NOT export (login failed):")
+        for f in login_failures:
+            logger.error(f"    {f['market']} - {f['message']}")
+        logger.error(f"Details: {LOGIN_FAILURES_LATEST}")
+        logger.error("!" * 60)
+
+    return {
+        "path": merged_path,
+        "results": all_results,
+        "login_failures": login_failures,
+        "login_report": str(LOGIN_FAILURES_LATEST),
+    }
 
 
 if __name__ == "__main__":
-    run_imei_export("08/31/2026", "09/06/2026", ["Dallas", "Arizona"])
+    outcome = run_imei_export("08/31/2026", "09/06/2026", ["Dallas", "Arizona"])
+    if outcome["login_failures"]:
+        sys.exit(2)   # non-zero so Task Scheduler / scripts can see the run wasn't clean
